@@ -151,109 +151,115 @@ func (us *UploadService) UploadFile(c *gin.Context) (*schemas.UploadPartOut, *ty
 
 	logger := logging.FromContext(c)
 
-	logger.Debugw("uploading file", "fileName", uploadQuery.FileName,
+	logger.Debugw("uploading chunk", "fileName", uploadQuery.FileName,
 		"partName", uploadQuery.PartName,
 		"bot", channelUser, "botNo", index,
 		"chunkNo", uploadQuery.PartNo, "partSize", fileSize)
 
-	err = tgc.RunWithAuth(c, client, token, func(ctx context.Context) error {
+	ctx, _ := context.WithCancel(context.Background())
 
-		channel, err := GetChannelById(ctx, client, channelId, channelUser)
+	errChan := make(chan error, 1)
 
-		if err != nil {
-			logger.Error("error", err)
-			return err
-		}
+	go func() {
+		errChan <- tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
 
-		var salt string
+			channel, err := GetChannelById(ctx, client, channelId, channelUser)
 
-		if uploadQuery.Encrypted {
-			//gen random Salt
-			salt, _ = generateRandomSalt()
-			cipher, _ := crypt.NewCipher(us.cnf.Uploads.EncryptionKey, salt)
-			fileSize = crypt.EncryptedSize(fileSize)
-			fileStream, _ = cipher.EncryptData(fileStream)
-		}
+			if err != nil {
+				return err
+			}
 
-		api := client.API()
+			var salt string
 
-		u := uploader.NewUploader(api).WithThreads(us.cnf.Uploads.Threads).WithPartSize(512 * 1024)
+			if uploadQuery.Encrypted {
+				//gen random Salt
+				salt, _ = generateRandomSalt()
+				cipher, _ := crypt.NewCipher(us.cnf.Uploads.EncryptionKey, salt)
+				fileSize = crypt.EncryptedSize(fileSize)
+				fileStream, _ = cipher.EncryptData(fileStream)
+			}
 
-		upload, err := u.Upload(c, uploader.NewUpload(uploadQuery.PartName, fileStream, fileSize))
+			api := client.API()
 
-		if err != nil {
-			return err
-		}
+			u := uploader.NewUploader(api).WithThreads(us.cnf.Uploads.Threads).WithPartSize(512 * 1024)
 
-		document := message.UploadedDocument(upload).Filename(uploadQuery.PartName).ForceFile(true)
+			upload, err := u.Upload(ctx, uploader.NewUpload(uploadQuery.PartName, fileStream, fileSize))
 
-		sender := message.NewSender(client.API())
+			if err != nil {
+				return err
+			}
 
-		target := sender.To(&tg.InputPeerChannel{ChannelID: channel.ChannelID,
-			AccessHash: channel.AccessHash})
+			document := message.UploadedDocument(upload).Filename(uploadQuery.PartName).ForceFile(true)
 
-		res, err := target.Media(c, document)
+			sender := message.NewSender(client.API())
 
+			target := sender.To(&tg.InputPeerChannel{ChannelID: channel.ChannelID,
+				AccessHash: channel.AccessHash})
+
+			res, err := target.Media(ctx, document)
+
+			if err != nil {
+				return err
+			}
+
+			updates := res.(*tg.Updates)
+
+			var message *tg.Message
+
+			for _, update := range updates.Updates {
+				channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
+				if ok {
+					message = channelMsg.Message.(*tg.Message)
+					break
+				}
+			}
+
+			if message.ID == 0 {
+				return fmt.Errorf("upload failed")
+			}
+
+			partUpload := &models.Upload{
+				Name:      uploadQuery.PartName,
+				UploadId:  uploadId,
+				PartId:    message.ID,
+				ChannelID: channelId,
+				Size:      fileSize,
+				PartNo:    uploadQuery.PartNo,
+				UserId:    userId,
+				Encrypted: uploadQuery.Encrypted,
+				Salt:      salt,
+			}
+
+			if err := us.db.Create(partUpload).Error; err != nil {
+				//delete uploaded part if upload fails
+				if message.ID != 0 {
+					api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{Channel: channel, ID: []int{message.ID}})
+				}
+				return err
+			}
+
+			out = mapper.ToUploadOut(partUpload)
+
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-errChan:
 		if err != nil {
 			logger.Debugw("upload failed", "fileName", uploadQuery.FileName,
 				"partName", uploadQuery.PartName,
 				"chunkNo", uploadQuery.PartNo)
-			return err
+			return nil, &types.AppError{Error: err}
 		}
-
-		updates := res.(*tg.Updates)
-
-		var message *tg.Message
-
-		for _, update := range updates.Updates {
-			channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
-			if ok {
-				message = channelMsg.Message.(*tg.Message)
-				break
-			}
-		}
-
-		if message.ID == 0 {
-			logger.Debugw("upload failed", "fileName", uploadQuery.FileName,
-				"partName", uploadQuery.PartName,
-				"chunkNo", uploadQuery.PartNo)
-			return fmt.Errorf("upload failed")
-		}
-
-		partUpload := &models.Upload{
-			Name:      uploadQuery.PartName,
-			UploadId:  uploadId,
-			PartId:    message.ID,
-			ChannelID: channelId,
-			Size:      fileSize,
-			PartNo:    uploadQuery.PartNo,
-			UserId:    userId,
-			Encrypted: uploadQuery.Encrypted,
-			Salt:      salt,
-		}
-
-		if err := us.db.Create(partUpload).Error; err != nil {
-			//delete uploaded part if upload fails
-			if message.ID != 0 {
-				api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{Channel: channel, ID: []int{message.ID}})
-			}
-			return err
-		}
-
-		out = mapper.ToUploadOut(partUpload)
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, &types.AppError{Error: err}
+		logger.Debugw("upload finished", "fileName", uploadQuery.FileName,
+			"partName", uploadQuery.PartName,
+			"chunkNo", uploadQuery.PartNo)
+		return out, nil
+	case <-ctx.Done():
+		return nil, &types.AppError{Error: ctx.Err()}
 	}
 
-	logger.Debugw("upload finished", "fileName", uploadQuery.FileName,
-		"partName", uploadQuery.PartName,
-		"chunkNo", uploadQuery.PartNo)
-
-	return out, nil
 }
 
 func generateRandomSalt() (string, error) {
