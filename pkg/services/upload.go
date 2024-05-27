@@ -145,7 +145,7 @@ func (us *UploadService) UploadFile(c *gin.Context) (*schemas.UploadPartOut, *ty
 	} else {
 		us.worker.Set(tokens, channelId)
 		token, index = us.worker.Next(channelId)
-		client, _ = tgc.BotClient(c, us.kv, us.cnf, token)
+		client, _ = tgc.BotClient(c, us.kv, us.cnf, token, us.cnf.Uploads.MaxRetries)
 		channelUser = strings.Split(token, ":")[0]
 	}
 

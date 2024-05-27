@@ -36,6 +36,7 @@ type TGConfig struct {
 	Uploads           struct {
 		EncryptionKey string
 		Threads       int
+		MaxRetries    int
 		Retention     time.Duration
 	}
 }

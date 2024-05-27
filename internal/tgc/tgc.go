@@ -21,11 +21,11 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func defaultMiddlewares(ctx context.Context) ([]telegram.Middleware, error) {
+func defaultMiddlewares(ctx context.Context, retries int) ([]telegram.Middleware, error) {
 
 	return []telegram.Middleware{
 		recovery.New(ctx, Backoff(tdclock.System)),
-		retry.New(5),
+		retry.New(retries),
 		floodwait.NewSimpleWaiter(),
 	}, nil
 }
@@ -65,7 +65,7 @@ func New(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHa
 }
 
 func NoAuthClient(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHandler, storage session.Storage) (*telegram.Client, error) {
-	middlewares, _ := defaultMiddlewares(ctx)
+	middlewares, _ := defaultMiddlewares(ctx, 5)
 	middlewares = append(middlewares, ratelimit.New(rate.Every(time.Millisecond*100), 5))
 	return New(ctx, config, handler, storage, middlewares...)
 }
@@ -85,15 +85,15 @@ func AuthClient(ctx context.Context, config *config.TGConfig, sessionStr string)
 	if err := loader.Save(context.TODO(), data); err != nil {
 		return nil, err
 	}
-	middlewares, _ := defaultMiddlewares(ctx)
+	middlewares, _ := defaultMiddlewares(ctx, 5)
 	middlewares = append(middlewares, ratelimit.New(rate.Every(time.Millisecond*
 		time.Duration(config.Rate)), config.RateBurst))
 	return New(ctx, config, nil, storage, middlewares...)
 }
 
-func BotClient(ctx context.Context, KV kv.KV, config *config.TGConfig, token string) (*telegram.Client, error) {
+func BotClient(ctx context.Context, KV kv.KV, config *config.TGConfig, token string, retries int) (*telegram.Client, error) {
 	storage := kv.NewSession(KV, kv.Key("botsession", token))
-	middlewares, _ := defaultMiddlewares(ctx)
+	middlewares, _ := defaultMiddlewares(ctx, retries)
 	if config.RateLimit {
 		middlewares = append(middlewares, ratelimit.New(rate.Every(time.Millisecond*
 			time.Duration(config.Rate)), config.RateBurst))
